@@ -1,0 +1,583 @@
+from flask import Flask, request, redirect, url_for, render_template_string, send_file
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+import datetime
+import calendar
+import io
+import os
+import json
+import threading
+import time
+import requests
+import socket
+import qrcode
+
+# ============================================================================
+# CONFIGURAÇÃO DE HARDWARE
+# ============================================================================
+USAR_VERSAO_V2 = True 
+
+try:
+    if USAR_VERSAO_V2:
+        from waveshare_epd import epd7in5_V2 as epd_driver
+    else:
+        from waveshare_epd import epd7in5 as epd_driver
+    HAS_SCREEN = True
+    print(f"SUCESSO: Driver Waveshare carregado! (Modo {'V2' if USAR_VERSAO_V2 else 'V1'})")
+except ImportError:
+    print("AVISO CRÍTICO: Pasta 'waveshare_epd' não encontrada.")
+    HAS_SCREEN = False
+
+# --- BIBLIOTECAS GOOGLE ---
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    TEM_GOOGLE = True
+except ImportError:
+    print("Aviso: Bibliotecas Google não instaladas.")
+    TEM_GOOGLE = False
+
+app = Flask(__name__)
+screen_lock = threading.Lock()
+
+# ============================================================================
+# CONFIGURAÇÕES GERAIS
+# ============================================================================
+ARQUIVO_DADOS = 'eventos.json'
+ARQUIVO_FOTO_CUSTOM = 'foto_custom.png' 
+ARQUIVO_HEADER_BG = 'header_bg.jpg'
+CREDENTIALS_FILE = 'credentials.json' 
+ID_CALENDARIO = 'seuemail@gmail.com' 
+
+INTERVALO_SYNC = 1800 
+
+WIDTH = 800
+HEIGHT = 480
+BACKGROUND_COLOR = (255, 255, 255) 
+TEXT_COLOR = (0, 0, 0)             
+GRID_COLOR = (0, 0, 0)             
+HIGHLIGHT_COLOR = (0, 0, 0)        
+TODAY_TEXT_COLOR = (255, 255, 255) 
+HEADER_BG_COLOR = (0, 0, 0)        
+HEADER_TEXT_COLOR = (255, 255, 255)
+# Cor mais escura para os dias de outros meses (para aparecer no dithering)
+OTHER_MONTH_BG = (200, 200, 200) 
+
+# ESTADO GLOBAL
+VIEW_DATE = datetime.date.today()
+DADOS_CLIMA = {"temp": "--", "chuva": "--", "icone": ""}
+MODO_ATUAL = "CALENDARIO" 
+
+# ============================================================================
+
+def carregar_eventos():
+    if not os.path.exists(ARQUIVO_DADOS): return {}
+    with open(ARQUIVO_DADOS, 'r') as f: return json.load(f)
+
+def salvar_eventos(dados):
+    with open(ARQUIVO_DADOS, 'w') as f: json.dump(dados, f, indent=4)
+
+def adicionar_meses(data_origem, meses_para_adicionar):
+    mes = data_origem.month - 1 + meses_para_adicionar
+    ano = data_origem.year + mes // 12
+    mes = mes % 12 + 1
+    day = min(data_origem.day, calendar.monthrange(ano, mes)[1])
+    return datetime.date(ano, mes, day)
+
+def get_ip_address():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('10.255.255.255', 1))
+        IP = s.getsockname()[0]
+    except Exception:
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    return IP
+
+def obter_clima():
+    lat = "-23.02"
+    lon = "-45.55"
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m&hourly=precipitation_probability&timezone=America%2FSao_Paulo&forecast_days=1"
+    try:
+        r = requests.get(url, timeout=10)
+        dados = r.json()
+        temp = round(dados['current']['temperature_2m'])
+        hora_atual = datetime.datetime.now().hour
+        prob_chuva = dados['hourly']['precipitation_probability'][hora_atual]
+        icone = "☀" 
+        if prob_chuva >= 30 and prob_chuva < 70: icone = "⛅"
+        elif prob_chuva >= 70: icone = "🌧" 
+        return {"temp": temp, "chuva": prob_chuva, "icone": icone}
+    except Exception as e:
+        print(f"Erro Clima: {e}")
+        return {"temp": "--", "chuva": "--", "icone": "?"}
+
+def obter_eventos_google():
+    if not TEM_GOOGLE or not os.path.exists(CREDENTIALS_FILE): return {}
+    try:
+        SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
+        creds = service_account.Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+        service = build('calendar', 'v3', credentials=creds)
+        agora = datetime.datetime.now(datetime.timezone.utc)
+        inicio = agora.replace(day=1, hour=0, minute=0, second=0).isoformat()
+        events_result = service.events().list(calendarId=ID_CALENDARIO, timeMin=inicio, maxResults=50, singleEvents=True, orderBy='startTime').execute()
+        novos_eventos = {}
+        for event in events_result.get('items', []):
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            data_iso = start[:10]
+            hora_iso = start[11:16] if 'T' in start else ""
+            titulo = event.get('summary', 'Sem Título')
+            if data_iso not in novos_eventos: novos_eventos[data_iso] = []
+            novos_eventos[data_iso].append({"hora": hora_iso, "desc": titulo, "origem": "google"})
+        return novos_eventos
+    except Exception as e:
+        print(f"Erro Google: {e}")
+        return {}
+
+def loop_sincronizacao():
+    global DADOS_CLIMA
+    time.sleep(30) 
+    while True:
+        if MODO_ATUAL == "CALENDARIO":
+            print("[SYNC] A atualizar dados...")
+            DADOS_CLIMA = obter_clima()
+            ev_google = obter_eventos_google()
+            
+            if ev_google:
+                dados_atuais = carregar_eventos()
+                ev_manuais = {}
+                for d, l in dados_atuais.items():
+                    manuais = [evt for evt in l if evt.get('origem') != 'google']
+                    if manuais: ev_manuais[d] = manuais
+                
+                dados_finais = ev_google.copy()
+                for d, l in ev_manuais.items():
+                    if d in dados_finais: dados_finais[d].extend(l)
+                    else: dados_finais[d] = l
+                salvar_eventos(dados_finais)
+
+            print("[SYNC] Redesenhando...")
+            gerar_imagem_calendario()
+        else:
+            print("[SYNC] Modo Imagem ativo. Ignorando atualização automática.")
+        time.sleep(INTERVALO_SYNC)
+
+def carregar_fontes():
+    try:
+        header = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 35)
+        day_num = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 18)
+        event_text = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 11)
+        week_text = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 14)
+        font_weather = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 30)
+    except:
+        header = day_num = event_text = week_text = font_weather = ImageFont.load_default()
+    return header, day_num, event_text, week_text, font_weather
+
+def atualizar_ecra_real(image_rgb, dither_mode=Image.FLOYDSTEINBERG):
+    if HAS_SCREEN:
+        if screen_lock.acquire(blocking=False): 
+            try:
+                print("[E-INK] A acordar ecrã...")
+                epd = epd_driver.EPD()
+                epd.init()
+                
+                print("[E-INK] Desenhando...")
+                image_bw = image_rgb.convert('1', dither=dither_mode)
+                epd.display(epd.getbuffer(image_bw))
+                print("[E-INK] Dormindo...")
+                epd.sleep()
+            except Exception as e:
+                print(f"[ERRO E-INK] {e}")
+                try: epd.init(); epd.sleep()
+                except: pass
+            finally:
+                screen_lock.release()
+        else:
+            print("[AVISO] Ecrã ocupado. Pulando.")
+    else:
+        print("[SIMULAÇÃO] Driver não encontrado.")
+
+def draw_text_with_outline(draw, pos, text, font, text_color, outline_color):
+    x, y = pos
+    draw.text((x-1, y), text, font=font, fill=outline_color)
+    draw.text((x+1, y), text, font=font, fill=outline_color)
+    draw.text((x, y-1), text, font=font, fill=outline_color)
+    draw.text((x, y+1), text, font=font, fill=outline_color)
+    draw.text((x, y), text, font=font, fill=text_color)
+
+# --- GERADOR DE CALENDÁRIO ---
+def gerar_imagem_calendario():
+    global VIEW_DATE, DADOS_CLIMA
+    font_header, font_day_num, font_event, font_week, font_weather = carregar_fontes()
+    img = Image.new('RGB', (WIDTH, HEIGHT), BACKGROUND_COLOR)
+    draw = ImageDraw.Draw(img)
+    
+    hoje_real = datetime.date.today()
+    ano_view, mes_view = VIEW_DATE.year, VIEW_DATE.month
+    
+    # --- CABEÇALHO ---
+    HEADER_H = 60
+    imagem_carregada = False
+    if os.path.exists(ARQUIVO_HEADER_BG):
+        try:
+            bg_img = Image.open(ARQUIVO_HEADER_BG)
+            bg_img = ImageOps.fit(bg_img, (WIDTH, HEADER_H), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+            img.paste(bg_img, (0, 0))
+            imagem_carregada = True
+            cor_fundo_texto = (0, 0, 0)
+        except: pass
+    
+    if not imagem_carregada:
+        draw.rectangle((0, 0, WIDTH, HEADER_H), fill=HEADER_BG_COLOR)
+        cor_fundo_texto = HEADER_BG_COLOR
+
+    meses = ["", "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
+    titulo_esq = f"{meses[mes_view]}"
+    draw_text_with_outline(draw, (20, 10), titulo_esq, font_header, HEADER_TEXT_COLOR, cor_fundo_texto)
+
+    try:
+        ip_atual = get_ip_address()
+        url_site = f"http://{ip_atual}:5000"
+        qr = qrcode.QRCode(box_size=1, border=1)
+        qr.add_data(url_site)
+        qr.make(fit=True)
+        qr_img = qr.make_image(fill_color="black", back_color="white")
+        qr_img = qr_img.resize((54, 54), Image.NEAREST)
+        img.paste(qr_img, (WIDTH - 54 - 3, 3))
+    except: pass
+
+    hora_str = datetime.datetime.now().strftime('%H:%M')
+    texto_clima = f"{hora_str}  |  {DADOS_CLIMA['temp']}°C  {DADOS_CLIMA['chuva']}% {DADOS_CLIMA['icone']}"
+    largura = draw.textlength(texto_clima, font=font_header)
+    draw_text_with_outline(draw, (WIDTH - 54 - 20 - largura - 15, 10), texto_clima, font_header, HEADER_TEXT_COLOR, cor_fundo_texto)
+
+    # --- GRELHA DINÂMICA INTELIGENTE ---
+    cal = calendar.TextCalendar(calendar.SUNDAY)
+    mes_dias = cal.monthdayscalendar(ano_view, mes_view)
+    
+    dias_para_desenhar = []
+    
+    primeira_semana = mes_dias[0]
+    zeros_inicio = primeira_semana.count(0)
+    if zeros_inicio > 0:
+        dt_inicio = datetime.date(ano_view, mes_view, 1)
+        for i in range(zeros_inicio, 0, -1):
+            d = dt_inicio - datetime.timedelta(days=i)
+            dias_para_desenhar.append((d.day, d.month, d.year, False)) 
+            
+    ultimo_dia = calendar.monthrange(ano_view, mes_view)[1]
+    for i in range(1, ultimo_dia + 1):
+        dias_para_desenhar.append((i, mes_view, ano_view, True)) 
+        
+    falta_para_fechar_semana = (7 - (len(dias_para_desenhar) % 7)) % 7
+    if falta_para_fechar_semana > 0:
+        dt_fim = datetime.date(ano_view, mes_view, ultimo_dia)
+        for i in range(1, falta_para_fechar_semana + 1):
+            d = dt_fim + datetime.timedelta(days=i)
+            dias_para_desenhar.append((d.day, d.month, d.year, False)) 
+
+    # --- DESENHAR GRELHA ---
+    num_semanas = len(dias_para_desenhar) // 7 
+    margin_top = 90
+    av_height = HEIGHT - margin_top - 5
+    row_h = av_height // num_semanas
+    col_w = WIDTH // 7
+
+    # BARRA DOS DIAS DA SEMANA COM FUNDO CINZENTO
+    draw.rectangle((0, 60, WIDTH, 90), fill=OTHER_MONTH_BG)
+    
+    dias_nome = ["DOM", "SEG", "TER", "QUA", "QUI", "SEX", "SÁB"]
+    for i, d in enumerate(dias_nome):
+        draw.text((i * col_w + 10, 70), d, font=font_week, fill=TEXT_COLOR)
+
+    evs = carregar_eventos()
+
+    for i, (dia, mes, ano, eh_atual) in enumerate(dias_para_desenhar):
+        r = i // 7
+        c = i % 7
+        x, y = c * col_w, r * row_h + margin_top
+        
+        if eh_atual:
+            draw.rectangle((x, y, x + col_w, y + row_h), outline=GRID_COLOR, fill=BACKGROUND_COLOR)
+        else:
+            draw.rectangle((x, y, x + col_w, y + row_h), outline=GRID_COLOR, fill=OTHER_MONTH_BG)
+
+        if (dia == hoje_real.day and mes == hoje_real.month and ano == hoje_real.year):
+            cx, cy = x + 15, y + 15
+            draw.ellipse((cx-15, cy-15, cx+15, cy+15), fill=HIGHLIGHT_COLOR)
+            draw.text((cx, cy), str(dia), font=font_day_num, fill=TODAY_TEXT_COLOR, anchor="mm")
+        else:
+            draw.text((x + 6, y + 4), str(dia), font=font_day_num, fill=TEXT_COLOR)
+
+        chave = f"{ano}-{mes:02d}-{dia:02d}"
+        if chave in evs:
+            lst = sorted(evs[chave], key=lambda x: x['hora'])
+            oy = 30
+            for evt in lst:
+                txt = f"{evt['hora']} {evt['desc']}" if evt['hora'] else evt['desc']
+                if len(txt) > 16: txt = txt[:15] + ".."
+                draw.text((x + 3, y + oy), txt, font=font_event, fill=TEXT_COLOR)
+                oy += 12
+                if oy > row_h - 5: break
+
+    if MODO_ATUAL == "CALENDARIO":
+        threading.Thread(target=atualizar_ecra_real, args=(img, Image.FLOYDSTEINBERG)).start()
+    
+    img_io = io.BytesIO()
+    img.save(img_io, 'PNG')
+    img_io.seek(0)
+    return img_io
+
+# --- SITE ---
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: sans-serif; padding: 20px; max-width: 600px; margin: 0 auto; background:#eee;}
+        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        img { width: 100%; border: 1px solid #333; }
+        input, button { width: 100%; padding: 10px; margin-top: 5px; }
+        button { background: #000; color: white; border: none; cursor: pointer; border-radius: 4px;}
+        .google { color: #4285F4; font-weight: bold; }
+        li { border-bottom: 1px solid #ddd; padding: 10px 0; display: flex; justify-content: space-between; }
+        .nav-buttons { display: flex; gap: 10px; margin-bottom: 10px; }
+        a.nav-btn { flex: 1; padding: 15px; font-size: 18px; font-weight: bold; text-align: center; text-decoration: none; color: white; border-radius: 4px; display: block; }
+        .prev-btn { background-color: #555; }
+        .next-btn { background-color: #555; }
+        .today-btn { background-color: #007bff; flex: 2;}
+        .mode-btn { background-color: #28a745; width: 48%; }
+        .reset-btn { background-color: #dc3545; width: 100%; margin-top:10px; font-size: 18px;}
+        .file-upload { border: 2px dashed #ccc; padding: 20px; text-align: center; margin-top:10px; }
+        /* Estilo para o Checkbox Dia Todo */
+        .chk-container { display: flex; align-items: center; background: #eee; padding: 5px 10px; border-radius: 4px; margin-left: 5px; flex: 1;}
+        .chk-container input { width: auto; margin: 0 5px 0 0; }
+        .chk-container label { font-size: 0.9em; cursor: pointer; }
+    </style>
+    <script>
+        function toggleHora() {
+            var chk = document.getElementById('chkDiaTodo');
+            var timeInput = document.getElementById('horaInput');
+            if (chk.checked) {
+                timeInput.disabled = true;
+                timeInput.required = false;
+                timeInput.value = '';
+            } else {
+                timeInput.disabled = false;
+                timeInput.required = true;
+            }
+        }
+    </script>
+</head>
+<body>
+    <div class="card">
+        <h2>Painel de Controle ({{ modo }})</h2>
+        
+        {% if modo == 'CALENDARIO' %}
+        <div class="nav-buttons">
+            <a href="/anterior" class="nav-btn prev-btn">◀</a>
+            <a href="/hoje" class="nav-btn today-btn">Hoje</a>
+            <a href="/proximo" class="nav-btn next-btn">▶</a>
+        </div>
+        <img src="/imagem_atual" id="calImg">
+        <div style="margin-top:10px; text-align:center;">
+            <button onclick="location.reload()" style="background:#444; width:48%">🔄 Atualizar Tela</button>
+            <a href="/forcar_sync"><button style="background:#4285F4; width:48%">☁️ Sync Google</button></a>
+        </div>
+        {% else %}
+        <img src="/imagem_atual" id="calImg">
+        <a href="/voltar_calendario"><button class="reset-btn">🔙 Voltar para Calendário</button></a>
+        {% endif %}
+    </div>
+
+    {% if modo == 'CALENDARIO' %}
+    <div class="card">
+        <h3>🖼️ Fundo do Cabeçalho</h3>
+        <div class="file-upload">
+            <form action="/upload_header" method="POST" enctype="multipart/form-data">
+                <input type="file" name="file" accept="image/*" required>
+                <button type="submit" class="mode-btn" style="background:#6c757d">Alterar Fundo Topo</button>
+            </form>
+        </div>
+
+        <h3>🖼️ Modo Porta-Retratos</h3>
+        <div class="file-upload">
+            <form action="/upload_foto" method="POST" enctype="multipart/form-data">
+                <input type="file" name="file" accept="image/*" required>
+                <button type="submit" class="mode-btn">Mostrar Foto Tela Cheia</button>
+            </form>
+        </div>
+    </div>
+
+    <div class="card">
+        <h3>📅 Adicionar Evento</h3>
+        <form action="/adicionar" method="POST">
+            <div style="margin-bottom:10px;">
+                <label>Data:</label>
+                <input type="date" name="data" required value="{{ view_date }}">
+            </div>
+            
+            <div style="display:flex; margin-bottom:10px;">
+                <div style="flex:2">
+                    <label>Hora:</label>
+                    <input type="time" name="hora" id="horaInput" required>
+                </div>
+                <div class="chk-container">
+                    <input type="checkbox" name="dia_todo" id="chkDiaTodo" onclick="toggleHora()">
+                    <label for="chkDiaTodo">Dia Todo</label>
+                </div>
+            </div>
+
+            <div style="margin-bottom:10px;">
+                <label>Descrição (Curta):</label>
+                <input type="text" name="descricao" placeholder="Descrição" maxlength="15" required>
+            </div>
+            <button type="submit">Salvar</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h3>📋 Agenda do Mês</h3>
+        <ul style="list-style:none; padding:0">
+        {% for data, eventos in agenda.items() %}
+            {% for evt in eventos %}
+            <li>
+                <span>{% if evt.get('origem') == 'google' %}<span class="google">G</span>{% endif %} <b>{{ data }}</b> {% if evt['hora'] %}{{ evt['hora'] }} - {% endif %}{{ evt['desc'] }}</span>
+                {% if evt.get('origem') != 'google' %}
+                <form action="/deletar" method="POST" style="display:inline;"><input type="hidden" name="data" value="{{ data }}"><input type="hidden" name="id" value="{{ loop.index0 }}"><button style="background:#dc3545; width:auto; padding:5px 10px;">X</button></form>
+                {% endif %}
+            </li>
+            {% endfor %}
+        {% endfor %}
+        </ul>
+    </div>
+    {% endif %}
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    dados = carregar_eventos()
+    view_str = VIEW_DATE.strftime("%Y-%m-%d")
+    return render_template_string(HTML_TEMPLATE, 
+                                  agenda=dict(sorted(dados.items())), 
+                                  view_date=view_str,
+                                  modo=MODO_ATUAL)
+
+@app.route('/imagem_atual')
+def imagem_atual():
+    if MODO_ATUAL == "CALENDARIO":
+        return send_file(gerar_imagem_calendario(), mimetype='image/png')
+    else:
+        if os.path.exists(ARQUIVO_FOTO_CUSTOM):
+            return send_file(ARQUIVO_FOTO_CUSTOM, mimetype='image/png')
+        return "Sem imagem", 404
+
+@app.route('/anterior')
+def anterior():
+    global VIEW_DATE
+    VIEW_DATE = adicionar_meses(VIEW_DATE, -1)
+    gerar_imagem_calendario()
+    return redirect(url_for('index'))
+
+@app.route('/proximo')
+def proximo():
+    global VIEW_DATE
+    VIEW_DATE = adicionar_meses(VIEW_DATE, 1)
+    gerar_imagem_calendario()
+    return redirect(url_for('index'))
+
+@app.route('/hoje')
+def hoje():
+    global VIEW_DATE
+    VIEW_DATE = datetime.date.today()
+    gerar_imagem_calendario()
+    return redirect(url_for('index'))
+
+@app.route('/upload_foto', methods=['POST'])
+def upload_foto():
+    global MODO_ATUAL
+    if 'file' not in request.files: return redirect(url_for('index'))
+    file = request.files['file']
+    if file.filename == '': return redirect(url_for('index'))
+    if file:
+        img = Image.open(file)
+        img = ImageOps.fit(img, (WIDTH, HEIGHT), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+        img.save(ARQUIVO_FOTO_CUSTOM)
+        MODO_ATUAL = "IMAGEM"
+        threading.Thread(target=atualizar_ecra_real, args=(img, Image.FLOYDSTEINBERG)).start()
+        return redirect(url_for('index'))
+
+@app.route('/upload_header', methods=['POST'])
+def upload_header():
+    if 'file' not in request.files: return redirect(url_for('index'))
+    file = request.files['file']
+    if file.filename == '': return redirect(url_for('index'))
+    if file:
+        img = Image.open(file)
+        img.save(ARQUIVO_HEADER_BG)
+        gerar_imagem_calendario()
+        return redirect(url_for('index'))
+
+@app.route('/voltar_calendario')
+def voltar_calendario():
+    global MODO_ATUAL
+    MODO_ATUAL = "CALENDARIO"
+    gerar_imagem_calendario()
+    return redirect(url_for('index'))
+
+@app.route('/forcar_sync')
+def forcar_sync():
+    threading.Thread(target=lambda: (salvar_eventos(obter_eventos_google()), gerar_imagem_calendario())).start()
+    return redirect(url_for('index'))
+
+@app.route('/adicionar', methods=['POST'])
+def adicionar():
+    d = request.form['data']
+    desc = request.form['descricao']
+    if 'dia_todo' in request.form: h = "" 
+    else: h = request.form.get('hora', '00:00')
+    dados = carregar_eventos()
+    if d not in dados: dados[d] = []
+    dados[d].append({"hora": h, "desc": desc, "origem": "manual"})
+    salvar_eventos(dados)
+    gerar_imagem_calendario()
+    return redirect(url_for('index'))
+
+@app.route('/deletar', methods=['POST'])
+def deletar():
+    d, idx = request.form['data'], int(request.form['id'])
+    dados = carregar_eventos()
+    if d in dados and 0 <= idx < len(dados[d]):
+        del dados[d][idx]
+        if not dados[d]: del dados[d]
+        salvar_eventos(dados)
+    gerar_imagem_calendario()
+    return redirect(url_for('index'))
+
+if __name__ == '__main__':
+    print("--- INICIANDO BOOT ---")
+    try:
+        DADOS_CLIMA = obter_clima() 
+        evs_google = obter_eventos_google() 
+        if evs_google:
+            dados_atuais = carregar_eventos()
+            ev_manuais = {}
+            for d, l in dados_atuais.items():
+                manuais = [evt for evt in l if evt.get('origem') != 'google']
+                if manuais: ev_manuais[d] = manuais
+            dados_finais = evs_google.copy()
+            for d, l in ev_manuais.items():
+                if d in dados_finais: dados_finais[d].extend(l)
+                else: dados_finais[d] = l
+            salvar_eventos(dados_finais)
+    except: pass
+
+    img_inicial = gerar_imagem_calendario() 
+
+    t = threading.Thread(target=loop_sincronizacao, daemon=True)
+    t.start()
+    
+    app.run(host='0.0.0.0', port=5000)
